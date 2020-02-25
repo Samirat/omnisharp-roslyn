@@ -202,6 +202,11 @@ namespace OmniSharp.DotNetTest
             }
         }
 
+        protected void EmitTestComletedEvent(DotNetTestResult result)
+        {
+            EventEmitter.Emit("TestCompleted", result);
+        }
+
         protected void EmitTestMessage(TestMessageLevel messageLevel, string message)
         {
             EventEmitter.Emit(TestMessageEvent.Id,
