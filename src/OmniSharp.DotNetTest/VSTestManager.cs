@@ -26,8 +26,13 @@ namespace OmniSharp.DotNetTest
         {
         }
 
-        private object GetDefaultRunSettings(string targetFrameworkVersion)
+        private object LoadRunSettingsOrDefault(string runSettingsPath, string targetFrameworkVersion)
         {
+            if (runSettingsPath != null)
+            {
+                return File.ReadAllText(runSettingsPath);
+            }
+
             if (!string.IsNullOrWhiteSpace(targetFrameworkVersion))
             {
                 return $@"
@@ -59,8 +64,13 @@ namespace OmniSharp.DotNetTest
             }
         }
 
-        protected override bool PrepareToConnect()
+        protected override bool PrepareToConnect(bool noBuild)
         {
+            if (noBuild)
+            {
+                return true;
+            }
+
             // The project must be built before we can test.
             var arguments = "build";
 
@@ -101,18 +111,34 @@ namespace OmniSharp.DotNetTest
             }
         }
 
-        public override GetTestStartInfoResponse GetTestStartInfo(string methodName, string testFrameworkName, string targetFrameworkVersion)
+        public override DiscoverTestsResponse DiscoverTests(string runSettings, string testFrameworkName, string targetFrameworkVersion)
+        {
+            var testCases = DiscoverTestsAsync(null, runSettings, targetFrameworkVersion, CancellationToken.None).Result;
+            return new DiscoverTestsResponse
+            {
+                Tests = testCases.Select(o => new Test
+                {
+                    FullyQualifiedName = o.FullyQualifiedName,
+                    DisplayName = o.DisplayName,
+                    Source = o.Source,
+                    CodeFilePath = o.CodeFilePath,
+                    LineNumber = o.LineNumber
+                }).ToArray()
+            };
+        }
+
+        public override GetTestStartInfoResponse GetTestStartInfo(string methodName, string runSettings, string testFrameworkName, string targetFrameworkVersion)
         {
             VerifyTestFramework(testFrameworkName);
 
-            var testCases = DiscoverTests(new string[] { methodName }, targetFrameworkVersion);
+            var testCases = DiscoverTests(new string[] { methodName }, runSettings, targetFrameworkVersion);
 
             SendMessage(MessageType.GetTestRunnerProcessStartInfoForRunSelected,
                 new
                 {
                     TestCases = testCases,
                     DebuggingEnabled = true,
-                    RunSettings = GetDefaultRunSettings(targetFrameworkVersion)
+                    RunSettings = LoadRunSettingsOrDefault(runSettings, targetFrameworkVersion)
                 });
 
             var message = ReadMessage();
@@ -126,21 +152,21 @@ namespace OmniSharp.DotNetTest
             };
         }
 
-        public override async Task<DebugTestGetStartInfoResponse> DebugGetStartInfoAsync(string methodName, string testFrameworkName, string targetFrameworkVersion, CancellationToken cancellationToken)
-         => await DebugGetStartInfoAsync(new string[] { methodName }, testFrameworkName, targetFrameworkVersion, cancellationToken);
+        public override async Task<DebugTestGetStartInfoResponse> DebugGetStartInfoAsync(string methodName, string runSettings, string testFrameworkName, string targetFrameworkVersion, CancellationToken cancellationToken)
+         => await DebugGetStartInfoAsync(new string[] { methodName }, runSettings, testFrameworkName, targetFrameworkVersion, cancellationToken);
 
-        public override async Task<DebugTestGetStartInfoResponse> DebugGetStartInfoAsync(string[] methodNames, string testFrameworkName, string targetFrameworkVersion, CancellationToken cancellationToken)
+        public override async Task<DebugTestGetStartInfoResponse> DebugGetStartInfoAsync(string[] methodNames, string runSettings, string testFrameworkName, string targetFrameworkVersion, CancellationToken cancellationToken)
         {
             VerifyTestFramework(testFrameworkName);
 
-            var testCases = await DiscoverTestsAsync(methodNames, targetFrameworkVersion, cancellationToken);
+            var testCases = await DiscoverTestsAsync(methodNames, runSettings, targetFrameworkVersion, cancellationToken);
 
             SendMessage(MessageType.GetTestRunnerProcessStartInfoForRunSelected,
                 new
                 {
                     TestCases = testCases,
                     DebuggingEnabled = true,
-                    RunSettings = GetDefaultRunSettings(targetFrameworkVersion)
+                    RunSettings = LoadRunSettingsOrDefault(runSettings, targetFrameworkVersion)
                 });
 
             var message = await ReadMessageAsync(cancellationToken);
@@ -186,16 +212,17 @@ namespace OmniSharp.DotNetTest
             }
         }
 
-        public override RunTestResponse RunTest(string methodName, string testFrameworkName, string targetFrameworkVersion)
-            => RunTest(new string[] { methodName }, testFrameworkName, targetFrameworkVersion);
+        public override RunTestResponse RunTest(string methodName, string runSettings, string testFrameworkName, string targetFrameworkVersion)
+            => RunTest(new string[] { methodName }, runSettings, testFrameworkName, targetFrameworkVersion);
 
-        public override RunTestResponse RunTest(string[] methodNames, string testFrameworkName, string targetFrameworkVersion)
+        public override RunTestResponse RunTest(string[] methodNames, string runSettings, string testFrameworkName, string targetFrameworkVersion)
         {
             VerifyTestFramework(testFrameworkName);
 
-            var testCases = DiscoverTests(methodNames, targetFrameworkVersion);
+            var testCases = DiscoverTests(methodNames, runSettings, targetFrameworkVersion);
 
-            var testResults = new List<TestResult>();
+            var passed = true;
+            var results = new List<DotNetTestResult>();
 
             if (testCases.Length > 0)
             {
@@ -204,7 +231,7 @@ namespace OmniSharp.DotNetTest
                     new
                     {
                         TestCases = testCases,
-                        RunSettings = GetDefaultRunSettings(targetFrameworkVersion)
+                        RunSettings = LoadRunSettingsOrDefault(runSettings, targetFrameworkVersion)
                     });
 
                 var done = false;
@@ -221,14 +248,26 @@ namespace OmniSharp.DotNetTest
 
                         case MessageType.TestRunStatsChange:
                             var testRunChange = message.DeserializePayload<TestRunChangedEventArgs>();
-                            testResults.AddRange(testRunChange.NewTestResults);
+                            var newResults = ConvertResults(testRunChange.NewTestResults);
+                            passed = passed &&  testRunChange.NewTestResults.Any(o => o.Outcome == TestOutcome.Failed);
+                            results.AddRange(newResults);
+                            foreach (var result in newResults)
+                            {
+                                EmitTestComletedEvent(result);
+                            }
                             break;
 
                         case MessageType.ExecutionComplete:
                             var payload = message.DeserializePayload<TestRunCompletePayload>();
                             if (payload.LastRunTests != null && payload.LastRunTests.NewTestResults != null)
                             {
-                                testResults.AddRange(payload.LastRunTests.NewTestResults);
+                                var lastRunResults = ConvertResults(payload.LastRunTests.NewTestResults);
+                                passed = passed && payload.LastRunTests.NewTestResults.Any(o => o.Outcome == TestOutcome.Failed);
+                                results.AddRange(lastRunResults);
+                                foreach (var result in lastRunResults)
+                                {
+                                    EmitTestComletedEvent(result);
+                                }
                             }
                             done = true;
                             break;
@@ -236,28 +275,30 @@ namespace OmniSharp.DotNetTest
                 }
             }
 
-            var results = testResults.Select(testResult =>
-                new DotNetTestResult
-                {
-                    MethodName = testResult.TestCase.FullyQualifiedName,
-                    Outcome = testResult.Outcome.ToString().ToLowerInvariant(),
-                    ErrorMessage = testResult.ErrorMessage,
-                    ErrorStackTrace = testResult.ErrorStackTrace,
-                    StandardOutput = testResult.Messages
-                                    .Where(message => message.Category == TestResultMessage.StandardOutCategory)
-                                    .Select(message => message.Text).ToArray(),
-                    StandardError = testResult.Messages.Where(message => message.Category == TestResultMessage.StandardErrorCategory)
-                    .Select(message => message.Text).ToArray()
-                });
-
             return new RunTestResponse
             {
                 Results = results.ToArray(),
-                Pass = !testResults.Any(r => r.Outcome == TestOutcome.Failed)
+                Pass = passed
             };
         }
 
-        private async Task<TestCase[]> DiscoverTestsAsync(string[] methodNames, string targetFrameworkVersion, CancellationToken cancellationToken)
+        private static IEnumerable<DotNetTestResult> ConvertResults(IEnumerable<TestResult> results)
+        {
+            return results.Select(testResult => new DotNetTestResult
+            {
+                MethodName = testResult.TestCase.FullyQualifiedName,
+                Outcome = testResult.Outcome.ToString().ToLowerInvariant(),
+                ErrorMessage = testResult.ErrorMessage,
+                ErrorStackTrace = testResult.ErrorStackTrace,
+                StandardOutput = testResult.Messages
+                    .Where(message => message.Category == TestResultMessage.StandardOutCategory)
+                    .Select(message => message.Text).ToArray(),
+                StandardError = testResult.Messages.Where(message => message.Category == TestResultMessage.StandardErrorCategory)
+                    .Select(message => message.Text).ToArray()
+            });
+        }
+
+        private async Task<TestCase[]> DiscoverTestsAsync(string[] methodNames, string runSettings, string targetFrameworkVersion, CancellationToken cancellationToken)
         {
             SendMessage(MessageType.StartDiscovery,
                 new
@@ -266,12 +307,16 @@ namespace OmniSharp.DotNetTest
                     {
                         Project.OutputFilePath
                     },
-                    RunSettings = GetDefaultRunSettings(targetFrameworkVersion)
+                    RunSettings = LoadRunSettingsOrDefault(runSettings, targetFrameworkVersion)
                 });
 
             var testCases = new List<TestCase>();
             var done = false;
-            var hashset = new HashSet<string>(methodNames);
+            HashSet<string> hashset = null;
+            if (methodNames != null)
+            {
+                hashset = new HashSet<string>(methodNames);
+            }
 
             while (!done)
             {
@@ -289,14 +334,14 @@ namespace OmniSharp.DotNetTest
 
                     case MessageType.TestCasesFound:
                         var foundTestCases = message.DeserializePayload<TestCase[]>();
-                        testCases.AddRange(foundTestCases.Where(isInRequestedMethods));
+                        testCases.AddRange(methodNames != null ? foundTestCases.Where(isInRequestedMethods) : foundTestCases);
                         break;
 
                     case MessageType.DiscoveryComplete:
                         var lastDiscoveredTests = message.DeserializePayload<DiscoveryCompletePayload>().LastDiscoveredTests;
                         if (lastDiscoveredTests != null)
                         {
-                            testCases.AddRange(lastDiscoveredTests.Where(isInRequestedMethods));
+                            testCases.AddRange(methodNames != null ? lastDiscoveredTests.Where(isInRequestedMethods) : lastDiscoveredTests);
                         }
 
                         done = true;
@@ -322,9 +367,9 @@ namespace OmniSharp.DotNetTest
             };
         }
 
-        private TestCase[] DiscoverTests(string[] methodNames, string targetFrameworkVersion)
+        private TestCase[] DiscoverTests(string[] methodNames, string runSettings, string targetFrameworkVersion)
         {
-            return DiscoverTestsAsync(methodNames, targetFrameworkVersion, CancellationToken.None).Result;
+            return DiscoverTestsAsync(methodNames, runSettings, targetFrameworkVersion, CancellationToken.None).Result;
         }
     }
 }
